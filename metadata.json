@@ -1,0 +1,7 @@
+{
+  "name": "Coupon Card Distribution",
+  "description": "A coupon card distribution application.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

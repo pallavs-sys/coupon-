@@ -5,11 +5,24 @@ declare const jsQR: any;
 
 // Configuration: paste your deployed Apps Script Web App URL and Google Sheet URL
 // Example SHEET_URL: https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit#gid=0
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby5m3KdHSbpxS2fMYxk6olQpH8MD4324tWlUozy7F4OQll3l0Dpzli405uRKoY-lOjd/exec';
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyBtYkmEKhr65swiesVKtQEZas_3gEDM3l6WEmR6cAF0uWqvACZWUIw1sJzWMpsUgbTiQ/exec';
 const SHEET_URL = 'https://docs.google.com/spreadsheets/d/1KhWbTmSkAP2Pxs0Yez4sVyZwlDxxPp323jp5Fq58iL4/edit?gid=0#gid=0';
 
-// Headers expected in the sheet's first row
-const SHEET_HEADERS = ['Coupon Code', 'Mobile', 'Name', 'Timestamp'] as const;
+// Registration tab headers we will write
+const REGISTRATION_HEADERS = ['QR Code', 'Mobile', 'Name', 'Status', 'OfferType', 'RegisteredDate'] as const;
+
+// Configure sheet tabs (GIDs)
+// Offers tab columns: Type | Status | Start Date | End Date | Qr Codes
+// Registrations tab columns: QR Code | Mobile | Name | Status | OfferType | RegisteredDate
+const OFFERS_GID = 2099398649;
+// NEW: Append-only registrations sheet gid
+const REGISTRATIONS_GID = 1257095471;
+
+// Debug logging
+const DEBUG = true;
+function debugLog(...args: any[]) {
+  if (DEBUG) console.log('[CouponApp]', ...args);
+}
 
 type SheetInfo = { sheetId: string | null; gid: number | null };
 
@@ -26,28 +39,238 @@ function extractSheetInfo(url: string): SheetInfo {
   }
 }
 
-async function appendRowsToSheet(params: {
+// Load a Google Sheet tab via gviz JSON using <script> injection to avoid CORS
+async function loadGvizSheet(sheetId: string, gid: number): Promise<any> {
+  debugLog('loadGvizSheet:start', { sheetId, gid });
+  return new Promise((resolve, reject) => {
+    const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:json;headers=1&gid=${gid}`;
+    const w: any = window as any;
+    const root = (w.google = w.google || {});
+    root.visualization = root.visualization || {};
+    root.visualization.Query = root.visualization.Query || {};
+    const prev = root.visualization.Query.setResponse;
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timed out loading sheet'));
+    }, 15000);
+    function cleanup() {
+      clearTimeout(timeout);
+      if (prev) root.visualization.Query.setResponse = prev;
+      if (script && script.parentNode) script.parentNode.removeChild(script);
+    }
+    root.visualization.Query.setResponse = function(resp: any) {
+      try {
+        try {
+          const cols = resp && resp.table && Array.isArray(resp.table.cols)
+            ? resp.table.cols.map((c: any) => (c && c.label) || '')
+            : [];
+          const rowCount = resp && resp.table && Array.isArray(resp.table.rows)
+            ? resp.table.rows.length
+            : 0;
+          debugLog('loadGvizSheet:response', { sheetId, gid, cols, rowCount });
+        } catch {}
+        resolve(resp);
+      } finally {
+        cleanup();
+      }
+    };
+    const script = document.createElement('script');
+    script.src = url;
+    script.async = true;
+    script.onerror = () => {
+      cleanup();
+      reject(new Error('Failed to load sheet'));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+function tableToObjects(resp: any): Array<Record<string, string>> {
+  if (!resp || !resp.table) return [];
+  let cols: string[] = (resp.table.cols || []).map((c: any) => String((c && c.label) || '').trim());
+  let rows = resp.table.rows || [];
+
+  // Fallback: if labels are blank, derive headers from the first row
+  const allBlank = cols.length > 0 && cols.every(h => !h);
+  if (allBlank && rows.length > 0) {
+    const headerCells = rows[0].c || [];
+    cols = headerCells.map((cell: any, idx: number) => {
+      const raw = cell && (cell.v != null ? cell.v : cell.f);
+      const header = (raw == null ? '' : String(raw)).trim();
+      return header || `col${idx + 1}`;
+    });
+    rows = rows.slice(1);
+    debugLog('tableToObjects:fallback_headers', { derivedHeaders: cols });
+  }
+
+  const out: Array<Record<string, string>> = [];
+  for (const r of rows) {
+    const cells = (r && r.c) || [];
+    const obj: Record<string, string> = {};
+    let empty = true;
+    for (let i = 0; i < cols.length; i++) {
+      const v = cells[i] && (cells[i].v != null ? cells[i].v : cells[i].f);
+      const s = v == null ? '' : String(v);
+      if (s.trim()) empty = false;
+      obj[cols[i]] = s;
+    }
+    if (!empty) out.push(obj);
+  }
+  debugLog('tableToObjects:converted', { columns: cols, rows: out.length });
+  return out;
+}
+
+function normalizeKeys<T extends Record<string, any>>(row: T): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of Object.keys(row || {})) {
+    out[String(k || '').trim().toLowerCase()] = String(row[k] ?? '');
+  }
+  return out;
+}
+
+function parseDdMmYyyy(value: string): Date | null {
+  const s = String(value || '').trim();
+  const m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/]?(\d{2,4})$/);
+  if (!m) return null;
+  let d = Number(m[1]);
+  let mo = Number(m[2]);
+  let y = Number(m[3]);
+  if (y < 100) y += 2000;
+  const dt = new Date(Date.UTC(y, mo - 1, d, 0, 0, 0));
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+function isDateInRangeInclusive(now: Date, start: Date | null, end: Date | null): boolean {
+  const t = now.getTime();
+  const startMs = start ? start.getTime() : -Infinity;
+  const endMs = end ? end.getTime() + 24 * 60 * 60 * 1000 - 1 : Infinity;
+  return t >= startMs && t <= endMs;
+}
+
+function splitCodes(csvLike: string): string[] {
+  // Split by comma (and tolerate stray newlines), trim whitespace
+  return String(csvLike || '')
+    .split(/[\n\r,]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+async function resolveOfferForQr(sheetId: string, qrCode: string): Promise<{ ok: true; offerType: string } | { ok: false; error: string }>{
+  try {
+    const resp = await loadGvizSheet(sheetId, OFFERS_GID);
+    const rows = tableToObjects(resp);
+    const now = new Date();
+    debugLog('resolveOfferForQr:start', { qrCode, offersCount: rows.length });
+    for (const r of rows) {
+      const R = normalizeKeys(r);
+      const type = String(R['type'] || '').trim();
+      const status = String(R['status'] || '').trim().toLowerCase();
+      const start = parseDdMmYyyy(R['start date']);
+      const end = parseDdMmYyyy(R['end date']);
+      const codesField = R['qr codes'] || R['qrcodes'] || R['qr_code'] || R['qr'];
+      const codes = new Set(splitCodes(codesField));
+      const contains = codes.has(String(qrCode).trim());
+      debugLog('resolveOfferForQr:row', { type, status, start, end, numCodes: codes.size, contains });
+      if (!contains) continue;
+      if (status !== 'active') return { ok: false, error: 'Offer not active for this QR code' };
+      if (!isDateInRangeInclusive(now, start, end)) return { ok: false, error: 'Offer not valid on this date' };
+      return { ok: true, offerType: type };
+    }
+    return { ok: false, error: 'QR code not eligible for any offer' };
+  } catch (e) {
+    debugLog('resolveOfferForQr:error', e);
+    return { ok: false, error: 'Could not read offers' };
+  }
+}
+
+async function isQrAlreadyAssigned(sheetId: string, qrCode: string): Promise<{ assigned: boolean; who?: string }>{
+  try {
+    const resp = await loadGvizSheet(sheetId, REGISTRATIONS_GID);
+    const rows = tableToObjects(resp);
+    debugLog('isQrAlreadyAssigned:start', { qrCode, registrationsCount: rows.length });
+    for (const r of rows) {
+      if (String(r['QR Code'] || '').trim() === String(qrCode).trim()) {
+        const who = `${String(r['Name'] || '').trim()} ${String(r['Mobile'] || '').trim()}`.trim();
+        return { assigned: true, who };
+      }
+    }
+    return { assigned: false };
+  } catch (e) {
+    debugLog('isQrAlreadyAssigned:error', e);
+    return { assigned: false };
+  }
+}
+
+// Not used for writing anymore, but keeping helper if needed
+async function getRegistrationHeaders(sheetId: string): Promise<string[]> {
+  try {
+    const resp = await loadGvizSheet(sheetId, REGISTRATIONS_GID);
+    const objs = tableToObjects(resp);
+    if (objs.length > 0) return Object.keys(objs[0]);
+    return Array.from(REGISTRATION_HEADERS);
+  } catch (e) {
+    return Array.from(REGISTRATION_HEADERS);
+  }
+}
+
+function findHeaderName(existingHeaders: string[], target: string): string | null {
+  const norm = (s: string) => String(s || '').replace(/\s+/g, '').toLowerCase();
+  const t = norm(target);
+  for (const h of existingHeaders) {
+    if (norm(h) === t) return h; // exact ignoring spaces/case
+  }
+  // common variants
+  const variants = [target, target.replace(/\s+/g, ''), target.replace(/\s+/g, '_')];
+  for (const v of variants) {
+    const vt = norm(v);
+    for (const h of existingHeaders) {
+      if (norm(h) === vt) return h;
+    }
+  }
+  return null;
+}
+
+async function postToAppsScript(params: {
   scriptUrl: string;
+  action: 'append' | 'replace' | 'assign' | 'delete';
   sheetId: string;
   gid: number | null;
   headers: readonly string[];
   rows: any[][];
+  matchColumns?: string[];
+  matchValues?: any[];
 }): Promise<{ success: boolean; error?: string }>{
   const body: any = {
-    action: 'append',
+    action: params.action,
     sheetId: params.sheetId,
     gid: params.gid == null ? 0 : params.gid,
     headers: params.headers,
     data: params.rows,
   };
-  // Use a single no-cors POST to avoid CORS preflight/failures and duplicate attempts
+  if (params.matchColumns && params.matchValues) {
+    body.matchColumns = params.matchColumns;
+    body.matchValues = params.matchValues;
+  }
   try {
-    await fetch(params.scriptUrl, {
-      method: 'POST',
-      // No headers -> simple request; mode no-cors lets the request succeed without reading response
-      mode: 'no-cors',
-      body: JSON.stringify(body),
-    });
+    const isDev = !!((import.meta as any).env && (import.meta as any).env.DEV);
+    const url = isDev ? '/apps-script' : params.scriptUrl;
+    if (params.action !== 'delete' && (!params.headers || !params.headers.length || !params.rows || !params.rows.length)) {
+      debugLog('postToAppsScript:invalid_payload', { headers: params.headers, rows: params.rows });
+      return { success: false, error: 'Client: Missing headers or data' };
+    }
+    const init: RequestInit = isDev
+      ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      : { method: 'POST', mode: 'no-cors', body: JSON.stringify(body) };
+    const res = await fetch(url, init);
+    if (isDev) {
+      try {
+        const json = await res.json();
+        debugLog('postToAppsScript:dev_response', json);
+        return { success: !!json && json.success === true, error: json && json.error };
+      } catch {
+        return { success: false, error: 'Invalid dev response' };
+      }
+    }
     return { success: true };
   } catch (err) {
     return { success: false, error: 'Network/CORS error while contacting Apps Script' };
@@ -140,16 +363,69 @@ const App = () => {
 
     setIsSubmitting(true);
     try {
-      const row = [code, mobile, name, new Date().toISOString()];
-      const result = await appendRowsToSheet({
+      debugLog('submit:start', { qrCode: code, mobile, name, sheetId, offersGid: OFFERS_GID, registrationsGid: REGISTRATIONS_GID });
+      // Client-side validations against offers and current registrations
+      const dup = await isQrAlreadyAssigned(sheetId, code);
+      if (dup.assigned) {
+        setError(`This QR code is already assigned${dup.who ? ` to ${dup.who}` : ''}.`);
+        debugLog('submit:blocked_already_assigned', { qrCode: code, who: dup.who });
+        return;
+      }
+
+      const offer = await resolveOfferForQr(sheetId, code);
+      if (!offer.ok) {
+        setError((offer as { ok: false; error: string }).error);
+        debugLog('submit:blocked_offer_validation', offer);
+        return;
+      }
+
+      // Prepare assignment update: delete existing QR row and append new assigned row
+      const existingHeaders = await getRegistrationHeaders(sheetId);
+      const hQr = findHeaderName(existingHeaders, 'QR Code') || 'QR Code';
+      const hMobile = findHeaderName(existingHeaders, 'Mobile') || 'Mobile';
+      const hName = findHeaderName(existingHeaders, 'Name') || 'Name';
+      const hStatus = findHeaderName(existingHeaders, 'Status') || 'Status';
+      const hOfferType = findHeaderName(existingHeaders, 'OfferType') || 'OfferType';
+      const hRegDate = findHeaderName(existingHeaders, 'RegisteredDate') || 'RegisteredDate';
+
+      const desired: Record<string, string> = {
+        [hQr]: String(code),
+        [hMobile]: String(mobile),
+        [hName]: String(name),
+        [hStatus]: 'Assigned',
+        [hOfferType]: String(offer.offerType),
+        [hRegDate]: new Date().toISOString(),
+      };
+      // Keep only headers that exist in the sheet; Apps Script will extend headers if needed
+      const headersToWrite = [hQr, hMobile, hName, hStatus, hOfferType, hRegDate].filter(Boolean);
+      const rowToWrite = headersToWrite.map(h => desired[h]);
+      debugLog('submit:append_only', { headersToWrite, rowToWrite });
+
+      // Append the new assigned row (append-only sheet)
+      const app = await postToAppsScript({
         scriptUrl: SCRIPT_URL,
+        action: 'append',
         sheetId,
-        gid: gid == null ? 0 : gid,
-        headers: SHEET_HEADERS,
-        rows: [row],
+        gid: REGISTRATIONS_GID,
+        headers: headersToWrite,
+        rows: [rowToWrite],
       });
-      if (!result.success) {
-        setError(result.error || t.submitError);
+      if (!app.success) {
+        setError(app.error || t.submitError);
+        debugLog('submit:append_failed', app);
+        return;
+      }
+
+      // Verify by re-reading registrations with short retries
+      let verified = false;
+      for (let attempt = 0; attempt < 5 && !verified; attempt++) {
+        await new Promise(r => setTimeout(r, 500 + attempt * 500));
+        const check = await isQrAlreadyAssigned(sheetId, code);
+        if (check.assigned) verified = true;
+        debugLog('submit:verify_attempt', { attempt, verified, check });
+      }
+      if (!verified) {
+        setError('Registration might not have saved. Please refresh and check the sheet.');
         return;
       }
 
@@ -160,8 +436,10 @@ const App = () => {
       setTimeout(() => {
         setIsRegistered(false);
       }, 3000);
+      debugLog('submit:success');
     } catch (err) {
       setError(t.submitError);
+      debugLog('submit:error', err);
     } finally {
       setIsSubmitting(false);
     }

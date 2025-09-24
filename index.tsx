@@ -201,6 +201,24 @@ async function isQrAlreadyAssigned(sheetId: string, qrCode: string): Promise<{ a
   }
 }
 
+async function isMobileAlreadyAssigned(sheetId: string, mobile: string): Promise<{ assigned: boolean; who?: string }>{
+  try {
+    const resp = await loadGvizSheet(sheetId, REGISTRATIONS_GID);
+    const rows = tableToObjects(resp);
+    debugLog('isMobileAlreadyAssigned:start', { mobile, registrationsCount: rows.length });
+    for (const r of rows) {
+      if (String(r['Mobile'] || '').trim() === String(mobile).trim()) {
+        const who = `${String(r['Name'] || '').trim()} ${String(r['QR Code'] || '').trim()}`.trim();
+        return { assigned: true, who };
+      }
+    }
+    return { assigned: false };
+  } catch (e) {
+    debugLog('isMobileAlreadyAssigned:error', e);
+    return { assigned: false };
+  }
+}
+
 // Not used for writing anymore, but keeping helper if needed
 async function getRegistrationHeaders(sheetId: string): Promise<string[]> {
   try {
@@ -317,6 +335,14 @@ const translations = {
     configError: 'Script URL மற்றும் Sheet URL அமைக்கவும்.',
     invalidSheetUrl: 'செல்லுபடியாகாத Google Sheet URL. முழு இணைப்பை ஒட்டவும் (gid உடன்).',
     submitError: 'ஷீட்டில் சேமிக்க முடியவில்லை. மீண்டும் முயற்சிக்கவும்.'
+  },
+  duplicateQrError: {
+    en: 'This QR code is already linked to a mobile number.',
+    ta: 'இந்த QR குறியீடு ஏற்கனவே ஒரு மொபைல் எண்ணுடன் இணைக்கப்பட்டுள்ளது.'
+  },
+  duplicateMobileError: {
+    en: 'This mobile number is already linked to another QR code.',
+    ta: 'இந்த மொபைல் எண் ஏற்கனவே வேறு QR குறியீட்டுடன் இணைக்கப்பட்டுள்ளது.'
   }
 };
 
@@ -364,18 +390,18 @@ const App = () => {
     setIsSubmitting(true);
     try {
       debugLog('submit:start', { qrCode: code, mobile, name, sheetId, offersGid: OFFERS_GID, registrationsGid: REGISTRATIONS_GID });
-      // Client-side validations against offers and current registrations
-      const dup = await isQrAlreadyAssigned(sheetId, code);
-      if (dup.assigned) {
-        setError(`This QR code is already assigned${dup.who ? ` to ${dup.who}` : ''}.`);
-        debugLog('submit:blocked_already_assigned', { qrCode: code, who: dup.who });
+      // Minimal validations: only uniqueness in final sheet
+      const dupQr = await isQrAlreadyAssigned(sheetId, code);
+      if (dupQr.assigned) {
+        setError(translations.duplicateQrError[language]);
+        debugLog('submit:blocked_duplicate_qr', { qrCode: code, who: dupQr.who });
         return;
       }
 
-      const offer = await resolveOfferForQr(sheetId, code);
-      if (!offer.ok) {
-        setError((offer as { ok: false; error: string }).error);
-        debugLog('submit:blocked_offer_validation', offer);
+      const dupMobile = await isMobileAlreadyAssigned(sheetId, mobile);
+      if (dupMobile.assigned) {
+        setError(translations.duplicateMobileError[language]);
+        debugLog('submit:blocked_duplicate_mobile', { mobile, who: dupMobile.who });
         return;
       }
 
@@ -385,7 +411,6 @@ const App = () => {
       const hMobile = findHeaderName(existingHeaders, 'Mobile') || 'Mobile';
       const hName = findHeaderName(existingHeaders, 'Name') || 'Name';
       const hStatus = findHeaderName(existingHeaders, 'Status') || 'Status';
-      const hOfferType = findHeaderName(existingHeaders, 'OfferType') || 'OfferType';
       const hRegDate = findHeaderName(existingHeaders, 'RegisteredDate') || 'RegisteredDate';
 
       const desired: Record<string, string> = {
@@ -393,11 +418,10 @@ const App = () => {
         [hMobile]: String(mobile),
         [hName]: String(name),
         [hStatus]: 'Assigned',
-        [hOfferType]: String(offer.offerType),
         [hRegDate]: new Date().toISOString(),
       };
       // Keep only headers that exist in the sheet; Apps Script will extend headers if needed
-      const headersToWrite = [hQr, hMobile, hName, hStatus, hOfferType, hRegDate].filter(Boolean);
+      const headersToWrite = [hQr, hMobile, hName, hStatus, hRegDate].filter(Boolean);
       const rowToWrite = headersToWrite.map(h => desired[h]);
       debugLog('submit:append_only', { headersToWrite, rowToWrite });
 

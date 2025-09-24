@@ -3,6 +3,57 @@ import { createRoot } from 'react-dom/client';
 
 declare const jsQR: any;
 
+// Configuration: paste your deployed Apps Script Web App URL and Google Sheet URL
+// Example SHEET_URL: https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/edit#gid=0
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby5m3KdHSbpxS2fMYxk6olQpH8MD4324tWlUozy7F4OQll3l0Dpzli405uRKoY-lOjd/exec';
+const SHEET_URL = 'https://docs.google.com/spreadsheets/d/1KhWbTmSkAP2Pxs0Yez4sVyZwlDxxPp323jp5Fq58iL4/edit?gid=0#gid=0';
+
+// Headers expected in the sheet's first row
+const SHEET_HEADERS = ['Coupon Code', 'Mobile', 'Name', 'Timestamp'] as const;
+
+type SheetInfo = { sheetId: string | null; gid: number | null };
+
+function extractSheetInfo(url: string): SheetInfo {
+  try {
+    if (!url) return { sheetId: null, gid: null };
+    const idMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    const gidMatch = url.match(/[?#&]gid=(\d+)/);
+    const sheetId = idMatch ? idMatch[1] : null;
+    const gid = gidMatch ? Number(gidMatch[1]) : null;
+    return { sheetId, gid };
+  } catch {
+    return { sheetId: null, gid: null };
+  }
+}
+
+async function appendRowsToSheet(params: {
+  scriptUrl: string;
+  sheetId: string;
+  gid: number | null;
+  headers: readonly string[];
+  rows: any[][];
+}): Promise<{ success: boolean; error?: string }>{
+  const body: any = {
+    action: 'append',
+    sheetId: params.sheetId,
+    gid: params.gid == null ? 0 : params.gid,
+    headers: params.headers,
+    data: params.rows,
+  };
+  // Use a single no-cors POST to avoid CORS preflight/failures and duplicate attempts
+  try {
+    await fetch(params.scriptUrl, {
+      method: 'POST',
+      // No headers -> simple request; mode no-cors lets the request succeed without reading response
+      mode: 'no-cors',
+      body: JSON.stringify(body),
+    });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: 'Network/CORS error while contacting Apps Script' };
+  }
+}
+
 const translations = {
   en: {
     registerCustomer: 'Issue Coupon Code',
@@ -19,7 +70,10 @@ const translations = {
     successMessage: 'Customer registered successfully!',
     scanQRCode: 'Scan QR Code',
     cancel: 'Cancel',
-    cameraError: 'Could not access the camera. Please check permissions.'
+    cameraError: 'Could not access the camera. Please check permissions.',
+    configError: 'Please set Script URL and Sheet URL in the app.',
+    invalidSheetUrl: 'Invalid Google Sheet URL. Paste the full link including gid.',
+    submitError: 'Could not save to sheet. Please try again.'
   },
   ta: {
     registerCustomer: 'கூப்பன் குறியீட்டை வழங்கு',
@@ -36,7 +90,10 @@ const translations = {
     successMessage: 'வாடிக்கையாளர் வெற்றிகரமாக பதிவு செய்யப்பட்டார்!',
     scanQRCode: 'QR குறியீட்டை ஸ்கேன் செய்யவும்',
     cancel: 'ரத்துசெய்',
-    cameraError: 'கேமராவை அணுக முடியவில்லை. அனுமதிகளைச் சரிபார்க்கவும்.'
+    cameraError: 'கேமராவை அணுக முடியவில்லை. அனுமதிகளைச் சரிபார்க்கவும்.',
+    configError: 'Script URL மற்றும் Sheet URL அமைக்கவும்.',
+    invalidSheetUrl: 'செல்லுபடியாகாத Google Sheet URL. முழு இணைப்பை ஒட்டவும் (gid உடன்).',
+    submitError: 'ஷீட்டில் சேமிக்க முடியவில்லை. மீண்டும் முயற்சிக்கவும்.'
   }
 };
 
@@ -48,6 +105,7 @@ const App = () => {
   const [error, setError] = useState('');
   const [language, setLanguage] = useState<'en' | 'ta'>('en');
   const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -60,7 +118,7 @@ const App = () => {
     setLanguage(prevLang => prevLang === 'en' ? 'ta' : 'en');
   };
 
-  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError('');
     
@@ -69,16 +127,44 @@ const App = () => {
       return;
     }
 
-    console.log('Registering customer:', { code, mobile, name });
-    
-    setCode('');
-    setMobile('');
-    setName('');
-    setIsRegistered(true);
+    if (!SCRIPT_URL || !SHEET_URL) {
+      setError(t.configError);
+      return;
+    }
 
-    setTimeout(() => {
+    const { sheetId, gid } = extractSheetInfo(SHEET_URL);
+    if (!sheetId) {
+      setError(t.invalidSheetUrl);
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const row = [code, mobile, name, new Date().toISOString()];
+      const result = await appendRowsToSheet({
+        scriptUrl: SCRIPT_URL,
+        sheetId,
+        gid: gid == null ? 0 : gid,
+        headers: SHEET_HEADERS,
+        rows: [row],
+      });
+      if (!result.success) {
+        setError(result.error || t.submitError);
+        return;
+      }
+
+      setCode('');
+      setMobile('');
+      setName('');
+      setIsRegistered(true);
+      setTimeout(() => {
         setIsRegistered(false);
-    }, 3000);
+      }, 3000);
+    } catch (err) {
+      setError(t.submitError);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleCloseScanner = () => {
@@ -228,9 +314,10 @@ const App = () => {
             
             <button
               type="submit"
-              className="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-all duration-300 transform hover:scale-105 shadow-lg"
+              className="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 disabled:opacity-60 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-all duration-300 transform hover:scale-105 shadow-lg"
+              disabled={isSubmitting}
             >
-              {t.registerButton}
+              {isSubmitting ? 'Saving…' : t.registerButton}
             </button>
             
             {error && <p className="text-red-500 text-center mt-4">{error}</p>}

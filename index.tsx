@@ -15,8 +15,10 @@ const REGISTRATION_HEADERS = ['QR Code', 'Mobile', 'Name', 'Status', 'OfferType'
 // Offers tab columns: Type | Status | Start Date | End Date | Qr Codes
 // Registrations tab columns: QR Code | Mobile | Name | Status | OfferType | RegisteredDate
 const OFFERS_GID = 2099398649;
-// NEW: Append-only registrations sheet gid
+// NEW: Append-only registrations sheet gid (final write/uniqueness checks)
 const REGISTRATIONS_GID = 1257095471;
+// QR master list tab gid (for existence validation only)
+const VALID_QR_LIST_GID = 0;
 
 // Debug logging
 const DEBUG = true;
@@ -187,10 +189,14 @@ async function isQrAlreadyAssigned(sheetId: string, qrCode: string): Promise<{ a
   try {
     const resp = await loadGvizSheet(sheetId, REGISTRATIONS_GID);
     const rows = tableToObjects(resp);
-    debugLog('isQrAlreadyAssigned:start', { qrCode, registrationsCount: rows.length });
+    const existingHeaders = rows.length > 0 ? Object.keys(rows[0]) : Array.from(REGISTRATION_HEADERS);
+    const hQr = findHeaderName(existingHeaders, 'QR Code') || 'QR Code';
+    const hMobile = findHeaderName(existingHeaders, 'Mobile') || 'Mobile';
+    const hName = findHeaderName(existingHeaders, 'Name') || 'Name';
+    debugLog('isQrAlreadyAssigned:start', { qrCode, registrationsCount: rows.length, hQr, hMobile, hName });
     for (const r of rows) {
-      if (String(r['QR Code'] || '').trim() === String(qrCode).trim()) {
-        const who = `${String(r['Name'] || '').trim()} ${String(r['Mobile'] || '').trim()}`.trim();
+      if (String(r[hQr] || '').trim() === String(qrCode).trim()) {
+        const who = `${String(r[hName] || '').trim()} ${String(r[hMobile] || '').trim()}`.trim();
         return { assigned: true, who };
       }
     }
@@ -205,10 +211,14 @@ async function isMobileAlreadyAssigned(sheetId: string, mobile: string): Promise
   try {
     const resp = await loadGvizSheet(sheetId, REGISTRATIONS_GID);
     const rows = tableToObjects(resp);
-    debugLog('isMobileAlreadyAssigned:start', { mobile, registrationsCount: rows.length });
+    const existingHeaders = rows.length > 0 ? Object.keys(rows[0]) : Array.from(REGISTRATION_HEADERS);
+    const hQr = findHeaderName(existingHeaders, 'QR Code') || 'QR Code';
+    const hMobile = findHeaderName(existingHeaders, 'Mobile') || 'Mobile';
+    const hName = findHeaderName(existingHeaders, 'Name') || 'Name';
+    debugLog('isMobileAlreadyAssigned:start', { mobile, registrationsCount: rows.length, hQr, hMobile, hName });
     for (const r of rows) {
-      if (String(r['Mobile'] || '').trim() === String(mobile).trim()) {
-        const who = `${String(r['Name'] || '').trim()} ${String(r['QR Code'] || '').trim()}`.trim();
+      if (String(r[hMobile] || '').trim() === String(mobile).trim()) {
+        const who = `${String(r[hName] || '').trim()} ${String(r[hQr] || '').trim()}`.trim();
         return { assigned: true, who };
       }
     }
@@ -216,6 +226,23 @@ async function isMobileAlreadyAssigned(sheetId: string, mobile: string): Promise
   } catch (e) {
     debugLog('isMobileAlreadyAssigned:error', e);
     return { assigned: false };
+  }
+}
+
+async function isQrCodeValid(sheetId: string, qrCode: string): Promise<boolean> {
+  try {
+    const resp = await loadGvizSheet(sheetId, VALID_QR_LIST_GID);
+    const rows = tableToObjects(resp);
+    const existingHeaders = rows.length > 0 ? Object.keys(rows[0]) : Array.from(REGISTRATION_HEADERS);
+    const hQr = findHeaderName(existingHeaders, 'QR Code') || 'QR Code';
+    const set = new Set(rows.map(r => String(r[hQr] || '').trim()).filter(Boolean));
+    const exists = set.has(String(qrCode).trim());
+    debugLog('isQrCodeValid', { qrCode, exists, total: set.size, hQr, gid: VALID_QR_LIST_GID });
+    return exists;
+  } catch (e) {
+    debugLog('isQrCodeValid:error', e);
+    // If we cannot validate, fail closed to avoid accepting invalid codes
+    return false;
   }
 }
 
@@ -343,6 +370,10 @@ const translations = {
   duplicateMobileError: {
     en: 'This mobile number is already linked to another QR code.',
     ta: 'இந்த மொபைல் எண் ஏற்கனவே வேறு QR குறியீட்டுடன் இணைக்கப்பட்டுள்ளது.'
+  },
+  invalidQrError: {
+    en: 'Invalid QR code. Please enter a valid QR code from the sheet.',
+    ta: 'செல்லுபடியாகாத QR குறியீடு. ஷீட்டில் உள்ள சரியான QR குறியீட்டை உள்ளிடவும்.'
   }
 };
 
@@ -355,6 +386,9 @@ const App = () => {
   const [language, setLanguage] = useState<'en' | 'ta'>('en');
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [codeError, setCodeError] = useState('');
+  const [mobileError, setMobileError] = useState('');
+  const [nameError, setNameError] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -376,6 +410,20 @@ const App = () => {
       return;
     }
 
+    // Client-side format checks
+    if (!/^\d{6}$/.test(code)) {
+      setError('QR code must be exactly 6 digits.');
+      return;
+    }
+    if (!/^\d{10}$/.test(mobile)) {
+      setError('Mobile number must be exactly 10 digits.');
+      return;
+    }
+    if (name && !/^[A-Za-z\s]+$/.test(name)) {
+      setError('Name must contain only letters and spaces.');
+      return;
+    }
+
     if (!SCRIPT_URL || !SHEET_URL) {
       setError(t.configError);
       return;
@@ -390,6 +438,14 @@ const App = () => {
     setIsSubmitting(true);
     try {
       debugLog('submit:start', { qrCode: code, mobile, name, sheetId, offersGid: OFFERS_GID, registrationsGid: REGISTRATIONS_GID });
+      // Validate QR code exists in the sheet
+      const valid = await isQrCodeValid(sheetId, code);
+      if (!valid) {
+        setError(translations.invalidQrError[language]);
+        debugLog('submit:blocked_invalid_qr', { qrCode: code });
+        return;
+      }
+
       // Minimal validations: only uniqueness in final sheet
       const dupQr = await isQrAlreadyAssigned(sheetId, code);
       if (dupQr.assigned) {
@@ -498,7 +554,10 @@ const App = () => {
             });
 
             if (qrCode) {
-                setCode(qrCode.data);
+                const scanned = String(qrCode.data || '');
+                const filtered = scanned.replace(/\D/g, '').slice(0, 6);
+                setCode(filtered);
+                setCodeError(filtered.length === 6 ? '' : 'QR code must be exactly 6 digits.');
                 handleCloseScanner();
                 return;
             }
@@ -564,11 +623,28 @@ const App = () => {
                   type="text"
                   id="code"
                   value={code}
-                  onChange={(e) => setCode(e.target.value)}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    const filtered = raw.replace(/\D/g, '').slice(0, 6);
+                    setCode(filtered);
+                    if (raw !== filtered) {
+                      setCodeError('Only digits allowed (6 digits).');
+                    } else if (filtered.length === 0) {
+                      setCodeError('');
+                    } else if (filtered.length !== 6) {
+                      setCodeError('QR code must be exactly 6 digits.');
+                    } else {
+                      setCodeError('');
+                    }
+                    setError('');
+                  }}
                   placeholder={t.codePlaceholder}
                   className="w-full pl-12 pr-12 py-3 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 transition-all duration-300"
                   required
                   aria-label="Coupon Code"
+                  aria-invalid={!!codeError}
+                  inputMode="numeric"
+                  maxLength={6}
                 />
                  <button
                     type="button"
@@ -579,6 +655,7 @@ const App = () => {
                     <i className="fa-solid fa-camera fa-lg"></i>
                   </button>
               </div>
+              {codeError && <p className="text-red-500 text-sm mt-1">{codeError}</p>}
             </div>
             
             <div className="mb-6 relative">
@@ -589,13 +666,31 @@ const App = () => {
                   type="tel"
                   id="mobile"
                   value={mobile}
-                  onChange={(e) => setMobile(e.target.value)}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    const filtered = raw.replace(/\D/g, '').slice(0, 10);
+                    setMobile(filtered);
+                    if (raw !== filtered) {
+                      setMobileError('Only digits allowed (10 digits).');
+                    } else if (filtered.length === 0) {
+                      setMobileError('');
+                    } else if (filtered.length !== 10) {
+                      setMobileError('Mobile number must be exactly 10 digits.');
+                    } else {
+                      setMobileError('');
+                    }
+                    setError('');
+                  }}
                   placeholder={t.mobilePlaceholder}
                   className="w-full pl-12 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 transition-all duration-300"
                   required
                   aria-label="Mobile Number"
+                  aria-invalid={!!mobileError}
+                  inputMode="numeric"
+                  maxLength={10}
                 />
               </div>
+              {mobileError && <p className="text-red-500 text-sm mt-1">{mobileError}</p>}
             </div>
 
             <div className="mb-8 relative">
@@ -606,12 +701,23 @@ const App = () => {
                   type="text"
                   id="name"
                   value={name}
-                  onChange={(e) => setName(e.target.value)}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    const filtered = raw.replace(/[^A-Za-z\s]/g, '');
+                    setName(filtered);
+                    if (raw !== filtered) {
+                      setNameError('Only letters and spaces are allowed.');
+                    } else {
+                      setNameError('');
+                    }
+                    setError('');
+                  }}
                   placeholder={t.namePlaceholder}
                   className="w-full pl-12 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 transition-all duration-300"
                   aria-label="Customer Name"
                 />
               </div>
+              {nameError && <p className="text-red-500 text-sm mt-1">{nameError}</p>}
             </div>
             
             <button
